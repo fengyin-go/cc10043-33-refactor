@@ -21,6 +21,87 @@ class RecordCheckpointService(BaseModuleService):
     ACTION_RULES = {"确认检查点": "已确认", "废弃检查点": "已过期"}
     NEGATIVE_ACTIONS = []
 
+    # ---- 共享读取接口：检查点取数边界与匹配规则的唯一责任点 ----
+    #
+    # 续采兼容检查（resume_policy）与偏移对应检查（offset_manager）都依赖检查点数据，
+    # 但旧检查点记录可能只有文本、任务名也可能把消费组和 Topic 拼在一起，读取哪一版、
+    # 按什么规则匹配都收敛到本模块（检查点归属服务），调用方不再各自直连数据仓库。
+
+    def snapshot_checkpoints(self) -> list[dict[str, Any]]:
+        """读取一份检查点快照，作为各项检查的同一份取数依据。
+
+        每次调用都从数据仓库取最新数据并返回行副本，副本上的改动不会回写仓库；
+        联合核对先取一次快照再复用，两个结论即可由同一次取数复跑。
+        单项调用不传快照时仍走这里，因此旧客户端单查一侧永远读到最新数据。
+        """
+        return [dict(row) for row in store.rows(self.MODULE)]
+
+    def match_by_point_type(
+        self, start_type: str, checkpoints: list[dict[str, Any]] | None = None
+    ) -> list[dict[str, Any]]:
+        """按检查点类型匹配：续采起点类型是检查点类型文本的子串即命中。
+
+        兼容旧检查点只有文本的情况（子串包含即算匹配，不做枚举化）。
+        """
+        rows = self.snapshot_checkpoints() if checkpoints is None else checkpoints
+        return [c for c in rows if start_type in str(c.get("检查点类型", ""))]
+
+    def match_by_group_topic(
+        self, group: str, topic: str, checkpoints: list[dict[str, Any]] | None = None
+    ) -> list[dict[str, Any]]:
+        """按消费组与 Topic 匹配：两者都作为子串出现在关联接入任务名中即命中。
+
+        兼容任务名拼接了消费组和主题的旧数据，保持原本的子串包含规则。
+        """
+        rows = self.snapshot_checkpoints() if checkpoints is None else checkpoints
+        return [
+            cp for cp in rows
+            if group in cp.get("关联接入任务", "") and topic in cp.get("关联接入任务", "")
+        ]
+
+    def joint_checkpoint_cross_check(
+        self,
+        offset_entry_id: int,
+        policy_entry_id: int,
+        checkpoints: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """联合核对：偏移对应检查与续采兼容检查从同一份检查点取数计算。
+
+        一次取数（checkpoints 缺省时现场读取最新快照）同时喂给两项检查，
+        返回中带回该快照，值班员可用它复跑整轮核对，解释两个数字为何不同。
+        单项对外接口的行为不变，旧客户端单查一侧仍读到最新数据。
+        """
+        from app.services import service_for
+
+        snapshot = self.snapshot_checkpoints() if checkpoints is None else checkpoints
+        offset_service = service_for("offset_manager")
+        resume_service = service_for("resume_policy")
+        offset_result = offset_service.validate_checkpoint(
+            offset_entry_id, checkpoints=snapshot)
+        compat_result = resume_service.validate_checkpoint_compat(
+            policy_entry_id, checkpoints=snapshot)
+        return {
+            "ok": bool(offset_result.get("ok")) and compat_result.get("compatible", False),
+            "offset_check": offset_result,
+            "compat_check": compat_result,
+            "offset_matched_ids": [
+                int(cp.get("id", 0))
+                for cp in self.match_by_group_topic(
+                    str(offset_result.get("group", "")),
+                    str(offset_result.get("topic", "")),
+                    checkpoints=snapshot,
+                )
+            ] if offset_result.get("ok") else [],
+            "compat_matched_ids": [
+                int(cp.get("id", 0))
+                for cp in self.match_by_point_type(
+                    str(compat_result.get("start_type", "")),
+                    checkpoints=snapshot,
+                )
+            ] if "message" not in compat_result else [],
+            "checkpoint_snapshot": snapshot,
+        }
+
     # ---- 业务扩展：断点记录与恢复 ----
 
     def create_checkpoint(self, task_name: str, point_type: str, point_value: str) -> dict[str, Any]:

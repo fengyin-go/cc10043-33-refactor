@@ -57,14 +57,22 @@ class ResumePolicyService(BaseModuleService):
             return {"threshold_reached": True, "action": degrade, "failures": failure_count, "limit": limit}
         return {"threshold_reached": False, "action": None, "failures": failure_count, "limit": limit}
 
-    def validate_checkpoint_compat(self, entry_id: int) -> dict[str, Any]:
-        """校验续采规则与检查点的兼容性。"""
+    def validate_checkpoint_compat(
+        self, entry_id: int, checkpoints: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
+        """校验续采规则与检查点的兼容性。
+
+        检查点的取数与类型匹配规则统一由记录检查点服务承担：单项调用不传
+        checkpoints 时由共享读取接口读取最新数据，联合核对时复用同一份快照。
+        返回字段、匹配条件与错误反馈保持不变。
+        """
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return {"compatible": False, "message": "规则不存在"}
         start_type = entry.get("续采起点类型", "")
-        checkpoints = store.rows("record_checkpoint")
-        matching = [c for c in checkpoints if start_type in str(c.get("检查点类型", ""))]
+        from app.services import service_for
+        checkpoint_service = service_for("record_checkpoint")
+        matching = checkpoint_service.match_by_point_type(start_type, checkpoints)
         return {"compatible": len(matching) > 0, "start_type": start_type,
                 "matching_checkpoints": len(matching)}
 

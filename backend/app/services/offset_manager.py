@@ -45,15 +45,23 @@ class OffsetManagerService(BaseModuleService):
             entry["status"] = "正常"
         return {"ok": True, "message": f"偏移推进至 {new_offset}", "delay": delay}
 
-    def validate_checkpoint(self, entry_id: int) -> dict[str, Any]:
-        """校验偏移量与检查点的对应关系。"""
+    def validate_checkpoint(
+        self, entry_id: int, checkpoints: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
+        """校验偏移量与检查点的对应关系。
+
+        检查点的取数与组/主题匹配规则统一由记录检查点服务承担：单项调用不传
+        checkpoints 时由共享读取接口读取最新数据，联合核对时复用同一份快照。
+        返回字段、匹配条件与错误反馈保持不变。
+        """
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return {"ok": False, "message": "偏移量记录不存在"}
         group = entry.get("消费组", "")
         topic = entry.get("Topic/Queue", "")
-        checkpoints = store.rows("record_checkpoint")
-        matched = [cp for cp in checkpoints if group in cp.get("关联接入任务", "") and topic in cp.get("关联接入任务", "")]
+        from app.services import service_for
+        checkpoint_service = service_for("record_checkpoint")
+        matched = checkpoint_service.match_by_group_topic(group, topic, checkpoints)
         return {
             "ok": True,
             "group": group,
